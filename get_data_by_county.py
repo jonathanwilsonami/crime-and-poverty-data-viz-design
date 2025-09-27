@@ -36,8 +36,25 @@ SUMMARIZED_OBI_BASE = "https://api.usa.gov/crime/fbi/cde/summarized/agency/{st}/
 # ----------------------------
 # Poverty Data Setups
 # ----------------------------
+state_map = pl.DataFrame({
+    "state_name": [
+        "Alabama","Alaska","Arizona","Arkansas","California","Colorado","Connecticut","Delaware",
+        "District of Columbia","Florida","Georgia","Hawaii","Idaho","Illinois","Indiana","Iowa",
+        "Kansas","Kentucky","Louisiana","Maine","Maryland","Massachusetts","Michigan","Minnesota",
+        "Mississippi","Missouri","Montana","Nebraska","Nevada","New Hampshire","New Jersey",
+        "New Mexico","New York","North Carolina","North Dakota","Ohio","Oklahoma","Oregon",
+        "Pennsylvania","Rhode Island","South Carolina","South Dakota","Tennessee","Texas","Utah",
+        "Vermont","Virginia","Washington","West Virginia","Wisconsin","Wyoming","Puerto Rico"
+    ],
+    "state_abbr": [
+        "AL","AK","AZ","AR","CA","CO","CT","DE","DC","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA",
+        "ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR",
+        "PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY","PR"
+    ]
+})
+
 ACS_YEAR = "2023"
-ACS_DATASET = "acs/acs1"
+ACS_DATASET = "acs/acs5"
 ACS_VARS = {
     "B01003_001E": "total_population",   # Total population
     "B17001_001E": "poverty_universe",   # Poverty universe (denominator)
@@ -311,29 +328,42 @@ def fetch_acs_poverty(state_fips: str | None = None) -> pl.DataFrame:
     """
     Download ACS poverty data (county level) as Polars DataFrame.
     If state_fips is provided (e.g., '01' for AL), restricts to that state.
+    Uses wildcard for all states, with a fallback loop over state FIPS codes.
     """
     url = POVERTY_BASE.format(ACS_YEAR=ACS_YEAR, ACS_DATASET=ACS_DATASET)
+
+    # scope query
     params = {}
     if state_fips:
         params["in"] = f"state:{state_fips}"
+    else:
+        params["in"] = "state:*"  # try all states in one call
 
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    raw = r.json()  # list of lists
+    # request + fallback
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        raw = r.json()
+        headers, rows = raw[0], raw[1:]
+        df = pl.DataFrame(rows, schema=headers, orient="row")
+    except requests.HTTPError:
+        US_STATE_FIPS = [
+            "01","02","04","05","06","08","09","10","11","12","13","15","16","17","18","19","20","21","22","23",
+            "24","25","26","27","28","29","30","31","32","33","34","35","36","37","38","39","40","41","42","44",
+            "45","46","47","48","49","50","51","53","54","55","56"
+        ]
+        parts = []
+        for s in US_STATE_FIPS:
+            rr = requests.get(url, params={"in": f"state:{s}"}, timeout=30)
+            rr.raise_for_status()
+            raw = rr.json()
+            parts.append(pl.DataFrame(raw[1:], schema=raw[0], orient="row"))
+        df = pl.concat(parts, how="vertical")
 
-    headers = raw[0]
-    rows = raw[1:]
-
-    # Build DF directly from rows + headers
-    df = pl.DataFrame(rows, schema=headers)
-
-    # Rename columns to friendly names using your ACS_VARS
+    # rename + cast + derived fields
     df = df.rename({**ACS_VARS, "NAME": "name"})
-
-    # Cast numeric columns and add convenience fields
     df = (
-        df
-        .with_columns(
+        df.with_columns(
             pl.col("total_population").cast(pl.Int64, strict=False),
             pl.col("poverty_universe").cast(pl.Int64, strict=False),
             pl.col("poverty_below").cast(pl.Int64, strict=False),
@@ -341,14 +371,11 @@ def fetch_acs_poverty(state_fips: str | None = None) -> pl.DataFrame:
             pl.col("county").cast(pl.Utf8),
         )
         .with_columns(
-            # 5-digit county FIPS (already zero-padded in API response)
             pl.concat_str([pl.col("state"), pl.col("county")]).alias("fips"),
-            # Safe poverty rate
             pl.when(pl.col("poverty_universe") > 0)
               .then(pl.col("poverty_below") / pl.col("poverty_universe"))
               .otherwise(None)
               .alias("poverty_rate"),
-            # Optional: uppercase county name without " County" for joins
             pl.col("name")
               .str.split_exact(", ", 2)
               .struct.field("field_0")
@@ -357,8 +384,8 @@ def fetch_acs_poverty(state_fips: str | None = None) -> pl.DataFrame:
               .alias("county_name_upper"),
         )
     )
-
     return df
+
 
 if __name__ == "__main__":
   ####################
@@ -376,202 +403,263 @@ if __name__ == "__main__":
   # all_counties.write_csv("poverty_by_county.csv")
   
   ####################
+  # Poverty clean up
+  ###################
+  # poverty_by_county_df = pl.read_csv("poverty_by_county.csv")
+  # 
+  # df = (
+  #   poverty_by_county_df.with_columns(pl.col("name").str.split_exact(", ", 2).alias("__parts"))
+  #     .with_columns([
+  #         pl.col("__parts").struct.field("field_1").alias("state_name"),
+  #     ])
+  #     .drop("__parts")
+  # )
+  # 
+  # df = df.join(state_map, on="state_name", how="left")
+  # 
+  # # 3) Drop the old FIPS parts and helper columns you said you don't need
+  # to_drop = [c for c in ["state", "county", "fips"] if c in df.columns]
+  # poverty_by_county_2023_final = df.drop(to_drop)
+  # poverty_by_county_2023_final = poverty_by_county_2023_final.rename({"county_name_upper": "county"})
+  # 
+  # poverty_by_county_2023_final.write_csv("poverty_by_county_2023_final.csv")
+  
+  ####################
   # crime by county 
   ###################
-  agencies_2023_df = pl.read_csv("agencies_2023.csv")
+  # agencies_2023_df = pl.read_csv("agencies_2023.csv")
+  # 
+  # agency_crime_2023_df = agency_crime_fetch_all_from_df(agencies_2023_df, OFFENSES)
+  # agency_crime_2023_df.write_csv("crime_by_county_2023.csv")
   
-  agency_crime_2023_df = agency_crime_fetch_all_from_df(agencies_2023_df, OFFENSES)
-  agency_crime_2023_df.write_csv("agency_crime_2023.csv")
-
-  # keep_states = ["AL"]
-  # agencies_3state_df = agencies_2023_df.filter(
-  #     pl.col("state_abbr").is_in(keep_states)
+  ###########
+  # Clean crime by county 
+  #############################
+  # Dedup 
+  # crime_by_county_2023_df = pl.read_csv("crime_by_county_2023.csv")
+  # df = pl.read_csv("crime_by_county_2023.csv").unique(maintain_order=True)
+  # 
+  # # -------------------------------
+  # # 1) Normalize blanks -> nulls for lat/lon
+  # # -------------------------------
+  # df = df.with_columns([
+  #     pl.when(pl.col("latitude").cast(pl.Utf8, strict=False).str.strip_chars() == "")
+  #       .then(None).otherwise(pl.col("latitude")).alias("latitude"),
+  #     pl.when(pl.col("longitude").cast(pl.Utf8, strict=False).str.strip_chars() == "")
+  #       .then(None).otherwise(pl.col("longitude")).alias("longitude"),
+  #     pl.col("total_2023").cast(pl.Float64),
+  #     pl.when(pl.col("offense") == "V").then(pl.lit("Violent Crime"))
+  #    .when(pl.col("offense") == "P").then(pl.lit("Property Crime"))
+  #    .otherwise(pl.col("offense"))
+  #    .alias("offense")
+  # ])
+  # 
+  # # -------------------------------
+  # # 2) Split comma-separated counties
+  # #    and divide total_2023 by 2 for those rows (unless zero)
+  # # -------------------------------
+  # has_comma = pl.col("county").cast(pl.Utf8, strict=False).str.contains(",")
+  # 
+  # no_split = df.filter(~has_comma)
+  # 
+  # split = (
+  #     df.filter(has_comma)
+  #       .with_columns([
+  #           pl.col("county").str.split(",").alias("parts"),
+  #           (pl.col("county").str.count_matches(",") + 1).alias("n_parts"),
+  #       ])
+  #       .explode("parts")
+  #       .with_columns([
+  #           pl.col("parts").str.strip_chars().alias("county"),
+  #           # if total_2023 == 0 keep 0; otherwise divide by 2 (your spec),
+  #           # even if there were more than 2 counties.
+  #           pl.when(pl.col("total_2023") == 0)
+  #             .then(pl.col("total_2023"))
+  #             .otherwise(pl.col("total_2023") / pl.lit(2.0))
+  #             .alias("total_2023"),
+  #       ])
+  #       .drop(["parts", "n_parts"])
+  #       .filter(pl.col("county") != "NOT SPECIFIED")
   # )
-  # #   
-  # summ_df = agency_crime_fetch_all_from_df(agencies_3state_df, OFFENSES)
-  # print(summ_df.head(4))
-  # summ_df.write_csv("test.csv")
+  # 
+  # df = pl.concat([no_split, split], how="vertical").unique(maintain_order=True)
+  # 
+  # # -------------------------------
+  # # 3) Aggregate to county level
+  # # -------------------------------
+  # county = (
+  #     df.group_by(["state_abbr", "county", "offense"])
+  #       .agg([
+  #           pl.col("total_2023").sum().alias("total_2023"),
+  #           pl.col("latitude").drop_nulls().first().alias("latitude"),
+  #           pl.col("longitude").drop_nulls().first().alias("longitude"),
+  #       ])
+  # )
+  # 
+  # # -------------------------------
+  # # 4) Geocode missing lat/lon with Census (fail-fast)
+  # # -------------------------------
+  # def fill_latlon_with_census(
+  #     df_in: pl.DataFrame,
+  #     state_col: str = "state_abbr",
+  #     county_col: str = "county",
+  #     lat_col: str = "latitude",
+  #     lon_col: str = "longitude",
+  #     connect_timeout: float = 4.0,
+  #     read_timeout: float = 8.0,
+  #     retry: int = 1,
+  #     pause: float = 0.2,  # small pause to be polite
+  # ) -> pl.DataFrame:
+  #     def _missing(expr: pl.Expr) -> pl.Expr:
+  #         return expr.is_null() | (
+  #             pl.col(expr.meta.output_name()).cast(pl.Utf8, strict=False).str.strip_chars() == ""
+  #         )
+  # 
+  #     need = (
+  #         df_in.with_row_index("_id")
+  #              .filter(_missing(pl.col(lat_col)) | _missing(pl.col(lon_col)))
+  #              .select("_id", state_col, county_col)
+  #     )
+  #     if need.is_empty():
+  #         return df_in
+  # 
+  #     pairs = need.select(state_col, county_col).unique()
+  # 
+  #     def census_geocode(state_abbr: str, county_name: str):
+  #         q = f"{county_name}, {state_abbr}, USA".strip(", ")
+  #         url = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
+  #         params = {"address": q, "benchmark": "Public_AR_Current", "format": "json"}
+  #         for _ in range(retry + 1):
+  #             try:
+  #                 r = requests.get(url, params=params, timeout=(connect_timeout, read_timeout))
+  #                 if r.status_code == 200:
+  #                     js = r.json()
+  #                     matches = js.get("result", {}).get("addressMatches", [])
+  #                     if matches:
+  #                         coords = matches[0].get("coordinates", {})
+  #                         # Census: x=lon, y=lat
+  #                         return coords.get("y"), coords.get("x")
+  #             except requests.RequestException:
+  #                 pass
+  #             time.sleep(pause)
+  #         return None, None
+  # 
+  #     lat_vals, lon_vals = [], []
+  #     for s, c in pairs.iter_rows():  # one call per unique (state, county)
+  #         lat, lon = census_geocode(s, c)
+  #         lat_vals.append(lat)
+  #         lon_vals.append(lon)
+  # 
+  #     looked_up = pairs.with_columns([
+  #         pl.Series("__lat", lat_vals),
+  #         pl.Series("__lon", lon_vals),
+  #     ])
+  # 
+  #     return (
+  #         df_in.with_row_index("_id")
+  #              .join(need.join(looked_up, on=[state_col, county_col], how="left"),
+  #                    on="_id", how="left")
+  #              .with_columns([
+  #                  pl.when(_missing(pl.col(lat_col))).then(pl.col("__lat")).otherwise(pl.col(lat_col)).alias(lat_col),
+  #                  pl.when(_missing(pl.col(lon_col))).then(pl.col("__lon")).otherwise(pl.col(lon_col)).alias(lon_col),
+  #              ])
+  #              .drop(["_id", "__lat", "__lon"])
+  #     )
+  # 
+  # county = fill_latlon_with_census(county)
+  # 
+  # # -------------------------------
+  # # 5) Final dedupe & quick duplicate report
+  # # -------------------------------
+  # county = county.unique(maintain_order=True)
+  # 
+  # dupes = (
+  #     county.group_by(["state_abbr", "county", "offense"])
+  #           .count()
+  #           .filter(pl.col("count") > 1)
+  #           .sort("count", descending=True)
+  # )
+  # 
+  # print("County-level rows:", county.height)
+  # print("Duplicate (state,county) pairs:", dupes.height)
+  # if dupes.height:
+  #     print(dupes.head(20))
+  # 
+  # # Final result
+  # crime_by_county_2023_df_cleaned = county
+  # 
+  # crime_by_county_2023_df_cleaned = (
+  #   crime_by_county_2023_df_cleaned.filter(
+  #       pl.col("county")
+  #         .cast(pl.Utf8, strict=False)
+  #         .str.strip_chars()
+  #         .str.to_uppercase()
+  #         != "NOT SPECIFIED"
+  #   )
+  #   .drop(["state_abbr_right", "county_right"])  # drop the last two columns by position
+  # )
+  # 
+  # crime_by_county_2023_df_cleaned.write_csv("crime_by_county_2023_final.csv")
+  
+  
+  ##################################
+  # Combine data
+  ####################################
+  crime = pl.read_csv("crime_by_county_2023_final.csv")
+  poverty = pl.read_csv("poverty_by_county_2023_final.csv")
+
+  final_df = (
+      crime
+      .select(["state_abbr", "county", "offense", "total_2023", "latitude", "longitude"])
+      .rename({"total_2023": "total_reported_crime"})
+      .join(
+          poverty.select([
+              "state_abbr", "county",
+              "total_population", "poverty_universe", "poverty_below", "poverty_rate"
+          ]),
+          on=["state_abbr", "county"],
+          how="left"
+      )
+      .with_columns(
+          pl.when(pl.col("total_population") > 0)
+            .then(pl.col("total_reported_crime") * pl.lit(100_000.0) / pl.col("total_population"))
+            .otherwise(None)
+            .alias("__per100k")
+      ).with_columns([
+          pl.when(pl.col("offense").is_in(["Property Crime", "P"]))
+            .then(pl.col("__per100k")).otherwise(None)
+            .alias("property_crime_per_100k"),
+          pl.when(pl.col("offense").is_in(["Violent Crime", "V"]))
+            .then(pl.col("__per100k")).otherwise(None)
+            .alias("violent_crime_per_100k"),
+      ]).drop(["__per100k"])
+  )
+  
+  # Drop rows with 0 population values 
+  final_df = final_df.with_columns(
+    (pl.col("total_population").is_null() | (pl.col("total_population") <= 0)).alias("no_population")
+  )
+  
+  # Have one county per row 
+  wide = (
+      final_df
+      .select([
+          "state_abbr","county","latitude","longitude","offense","total_reported_crime",
+          "total_population","poverty_universe","poverty_below","poverty_rate",
+          "property_crime_per_100k","violent_crime_per_100k","no_population"
+      ])
+      .pivot(
+          index=[
+              "state_abbr","county","latitude","longitude",
+              "total_population","poverty_universe","poverty_below","poverty_rate","no_population"
+          ],
+          on="offense",
+          values=["total_reported_crime","property_crime_per_100k","violent_crime_per_100k"],
+          aggregate_function="first"
+      )
+  )
+
+  wide.write_csv("crime_poverty_by_county_2023.csv")
 
 
-# # ----------------------------
-# # Census ACS fetch
-# # ----------------------------
-# def fetch_acs_state_poverty(year: str = ACS_YEAR,
-#                             dataset: str = ACS_DATASET,
-#                             var_map: dict[str, str] = ACS_VARS) -> pl.DataFrame:
-#     """
-#     Fetch ACS 1-year state totals for population + poverty, all states.
-#     Returns Polars DF with: state_name, state_fips, total_population, poverty_universe,
-#     poverty_below, poverty_rate_pct.
-#     """
-#     base = f"https://api.census.gov/data/{year}/{dataset}"
-#     vars_param = "NAME," + ",".join(var_map.keys())
-#     url = f"{base}?get={vars_param}&for=state:*"
-#     if CENSUS_API_KEY:
-#         url += f"&key={CENSUS_API_KEY}"
-# 
-#     r = requests.get(url, timeout=60)
-#     r.raise_for_status()
-#     data = r.json()  # first row header
-# 
-#     header, *rows = data
-#     df = pl.DataFrame(rows, schema=header)
-# 
-#     # Rename coded vars to readable names
-#     rename_map = {code: name for code, name in var_map.items()}
-#     df = df.rename(rename_map)
-# 
-#     # Cast numeric + compute poverty rate (% of poverty universe)
-#     num_cols = list(rename_map.values())
-#     df = df.with_columns([pl.col(c).cast(pl.Float64) for c in num_cols])
-#     df = df.with_columns(
-#         (pl.col("poverty_below") / pl.col("poverty_universe") * 100.0)
-#         .alias("poverty_rate_pct")
-#     )
-# 
-#     acs_df = df.select(
-#         pl.col("NAME").alias("state_name"),
-#         pl.col("state").alias("state_fips"),
-#         "total_population",
-#         "poverty_universe",
-#         "poverty_below",
-#         "poverty_rate_pct"
-#     )
-#     return acs_df
-# 
-# # ----------------------------
-# # FBI CDE fetch (per state/offense)
-# # ----------------------------
-# def fbi_crime_fetch_one(state: str, offense: str, retries: int = 3, backoff: float = 0.8) -> dict:
-#     """
-#     Call the CDE summarized/state endpoint with offense tokens (V or P).
-#     Returns a dict: state_abbr, state_name, offense, total_2024 (monthly sum).
-#     """
-#     params = {"from": YEAR_FROM, "to": YEAR_TO, "API_KEY": FBI_API_KEY}
-#     url = FBI_BASE.format(st=state, off=offense)
-# 
-#     for attempt in range(retries):
-#         try:
-#             r = requests.get(url, params=params, timeout=30)
-#             r.raise_for_status()
-#             data = r.json()
-# 
-#             # Navigate new CDE shape:
-#             # data["offenses"]["actuals"] is a dict with keys like "Alabama", "United States", "Alabama Clearances"
-#             actuals = (data.get("offenses") or {}).get("actuals") or {}
-# 
-#             # Find the key for this state (exclude US and Clearances)
-#             state_keys = [k for k in actuals.keys() if "United States" not in k and "Clearances" not in k]
-#             if not state_keys:
-#                 return {
-#                     "state_abbr": state, "state_name": None, "offense": offense,
-#                     "total_2024": None, "error": "No state key found"
-#                 }
-# 
-#             state_name = state_keys[0]
-#             months = actuals.get(state_name, {}) or {}
-# 
-#             total_2024 = sum(
-#                 v for m, v in months.items()
-#                 if isinstance(v, (int, float)) and m.endswith(TARGET_YEAR_SUFFIX)
-#             )
-# 
-#             return {
-#                 "state_abbr": state,
-#                 "state_name": state_name,
-#                 "offense": offense,
-#                 "total_2024": int(total_2024)
-#             }
-# 
-#         except requests.RequestException as e:
-#             if attempt == retries - 1:
-#                 return {
-#                     "state_abbr": state, "state_name": None, "offense": offense,
-#                     "total_2024": None, "error": str(e)
-#                 }
-#             time.sleep(backoff * (2 ** attempt))
-# 
-# # Parallel fan-out to all states × offenses
-# def fbi_crime_fetch_all(states: list[str], offenses: list[str]) -> list[dict]:
-#     jobs = [(st, off) for st in states for off in offenses]
-#     rows: list[dict] = []
-#     with cf.ThreadPoolExecutor(max_workers=12) as ex:
-#         futures = {ex.submit(fbi_crime_fetch_one, st, off): (st, off) for st, off in jobs}
-#         for fut in cf.as_completed(futures):
-#             rows.append(fut.result())
-#     return rows
-# 
-# # ----------------------------
-# # Main
-# # ----------------------------
-# def main():
-#     # FBI crime (state x offense)
-#     crime_raw = fbi_crime_fetch_all(STATES, OFFENSES)
-#     crime_df = pl.DataFrame(crime_raw)
-# 
-#     # Census ACS population & poverty (one row per state)
-#     acs_df = fetch_acs_state_poverty()
-# 
-#     # Join and compute rates
-#     combined_data = (
-#         crime_df
-#         .join(acs_df, on="state_name", how="left")
-#         .with_columns(
-#             # avoid divide-by-zero/nulls
-#             pl.when(pl.col("total_population") > 0)
-#               .then((pl.col("total_2024") / pl.col("total_population")) * 100_000)
-#               .otherwise(None)
-#               .alias("crime_rate_per_100k"),
-#             # human-friendly offense label
-#             pl.when(pl.col("offense") == "V").then(pl.lit("Violent Crime"))
-#              .when(pl.col("offense") == "P").then(pl.lit("Property Crime"))
-#              .otherwise(pl.lit("Other"))
-#              .alias("offense_label")
-#         )
-#         .rename({
-#             "total_2024": "total_crime",
-#             "poverty_below": "below_poverty"
-#         })
-#         .select(
-#             "state_abbr", "state_name", "state_fips",
-#             "offense", "offense_label",
-#             "total_crime", "crime_rate_per_100k",
-#             "total_population", "poverty_universe", "below_poverty", "poverty_rate_pct"
-#         )
-#         .sort(["state_abbr", "offense_label"])
-#     )
-# 
-#     # Write output
-#     out_csv = "state_crime_poverty_2024_long.csv"
-#     combined_data.write_csv(out_csv)
-#     print(f"Wrote {out_csv} with {combined_data.shape[0]} rows")
-#     print(combined_data.head(10))
-# 
-#     # Optional: also produce a wide table with V/P columns
-#     wide = (
-#         combined_data
-#         .select(
-#             "state_abbr", "state_name", "state_fips",
-#             "offense", "total_crime", "crime_rate_per_100k"
-#         )
-#         .pivot(
-#             values=["total_crime", "crime_rate_per_100k"],
-#             index=["state_abbr", "state_name", "state_fips"],
-#             columns="offense",
-#             aggregate_function="first"
-#         )
-#         .rename({
-#             "total_crime_V": "violent_total_2024",
-#             "crime_rate_per_100k_V": "violent_rate_per_100k",
-#             "total_crime_P": "property_total_2024",
-#             "crime_rate_per_100k_P": "property_rate_per_100k",
-#         })
-#         .sort(["state_abbr"])
-#     )
-#     out_wide = "state_crime_poverty_2024_wide.csv"
-#     wide.write_csv(out_wide)
-#     print(f"Wrote {out_wide} with {wide.shape[0]} rows")
-#     print(wide.head(10))
-# 
-# if __name__ == "__main__":
-#     main()
+
