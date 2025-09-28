@@ -133,50 +133,156 @@ POVERTY_BASE = (
 )
 
 def main():
-  crime_raw = fbi_crime_fetch_all(STATES, OFFENSES)
-  crime_df = pl.DataFrame(crime_raw)
-
-  acs_df = fetch_acs_state_poverty()
-
-  combined_data = (
-      crime_df
-      .join(acs_df, on="state_name", how="left")
-      .with_columns(
-          # compute per-100k using ACS total population
-          (pl.col("total_2023") / pl.col("total_population") * 100_000)
-          .alias("rate_per_100k")
-      )
-      .select(
-          "state_abbr", "state_name", "offense",
-          "total_2023",
-          "rate_per_100k",
-          "total_population",
-          "poverty_universe",
-          "poverty_below",
-          "poverty_rate_pct"
-      )
-  )
+  # crime_raw = fbi_crime_fetch_all(STATES, OFFENSES)
+  # crime_df = pl.DataFrame(crime_raw)
+  # 
+  # acs_df = fetch_acs_state_poverty()
+  # 
+  # combined_data = (
+  #     crime_df
+  #     .join(acs_df, on="state_name", how="left")
+  #     .with_columns(
+  #         # compute per-100k using ACS total population
+  #         (pl.col("total_2023") / pl.col("total_population") * 100_000)
+  #         .alias("rate_per_100k")
+  #     )
+  #     .select(
+  #         "state_abbr", "state_name", "offense",
+  #         "total_2023",
+  #         "rate_per_100k",
+  #         "total_population",
+  #         "poverty_universe",
+  #         "poverty_below",
+  #         "poverty_rate_pct"
+  #     )
+  # )
+  # 
+  # # Fix up table
+  # combined_data = (
+  #   combined_data.with_columns(
+  #       pl.when(pl.col("offense") == "V").then(pl.lit("Violent Crime"))
+  #        .when(pl.col("offense") == "P").then(pl.lit("Property Crime"))
+  #        .otherwise(pl.lit("Other"))
+  #        .alias("offense_label")
+  #   )
+  #   .sort(pl.col("offense_label").str.to_lowercase(), nulls_last=True)
+  # )
+  # 
+  # combined_data = combined_data.rename({
+  #   "total_2023": "total_crime",
+  #   "rate_per_100k": "crime_rate_per_100k",
+  #   "poverty_below": "below_poverty"
+  # })
+  # 
+  # combined_data.write_csv("crime_plus_poverty_2023.csv")
+  # print(f"Rows in combined_data: {combined_data.shape[0]}")
+  # print(combined_data.head(8))
   
-  # Fix up table
-  combined_data = (
-    combined_data.with_columns(
-        pl.when(pl.col("offense") == "V").then(pl.lit("Violent Crime"))
-         .when(pl.col("offense") == "P").then(pl.lit("Property Crime"))
-         .otherwise(pl.lit("Other"))
-         .alias("offense_label")
+  ###########
+  # Addiitonal Data clean and prep
+  #####################
+  crime_plus_poverty_2023 = pl.read_csv("data/crime_plus_poverty_2023.csv")
+
+  crime_plus_poverty_2023 = (
+    crime_plus_poverty_2023
+    .pivot(
+        index=[
+            "state_abbr", "state_name",
+            "total_population", "poverty_universe", "below_poverty", "poverty_rate_pct"
+            # NOTE: do NOT include 'offense' or 'offense_label' here
+        ],
+        on="offense",                                # values are 'V' or 'P'
+        values=["total_crime", "crime_rate_per_100k"],
+        aggregate_function="first"                   # or "sum" if you need to sum duplicates
     )
-    .sort(pl.col("offense_label").str.to_lowercase(), nulls_last=True)
+    # Rename columns: *_V → *_violent,  *_P → *_property
+    .rename({
+        "total_crime_V": "total_crime_violent",
+        "total_crime_P": "total_crime_property",
+        "crime_rate_per_100k_V": "crime_rate_per_100k_violent",
+        "crime_rate_per_100k_P": "crime_rate_per_100k_property",
+    })
+  )
+
+  # (optional) sort for readability
+  wide = crime_plus_poverty_2023.sort(["state_abbr", "state_name"])
+  
+  
+  
+  ######## Geocoding
+  ABBR_TO_NAME = {
+    "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
+    "CO":"Colorado","CT":"Connecticut","DE":"Delaware","FL":"Florida","GA":"Georgia",
+    "HI":"Hawaii","ID":"Idaho","IL":"Illinois","IN":"Indiana","IA":"Iowa","KS":"Kansas",
+    "KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland","MA":"Massachusetts",
+    "MI":"Michigan","MN":"Minnesota","MS":"Mississippi","MO":"Missouri","MT":"Montana",
+    "NE":"Nebraska","NV":"Nevada","NH":"New Hampshire","NJ":"New Jersey","NM":"New Mexico",
+    "NY":"New York","NC":"North Carolina","ND":"North Dakota","OH":"Ohio","OK":"Oklahoma",
+    "OR":"Oregon","PA":"Pennsylvania","RI":"Rhode Island","SC":"South Carolina",
+    "SD":"South Dakota","TN":"Tennessee","TX":"Texas","UT":"Utah","VT":"Vermont",
+    "VA":"Virginia","WA":"Washington","WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming",
+    "DC":"District of Columbia",
+  }
+  
+  def geocode_state_latlon(state_query: str) -> tuple[float|None,float|None]:
+      """
+      Use Open-Meteo Geocoding API to get (lat, lon) for a US state name.
+      Returns (latitude, longitude) or (None, None) if not found.
+      """
+      url = "https://geocoding-api.open-meteo.com/v1/search"
+      params = {"name": state_query, "country": "US", "count": 1, "language": "en"}
+      try:
+          r = requests.get(url, params=params, timeout=10)
+          r.raise_for_status()
+          data = r.json()
+          results = data.get("results") or []
+          if results:
+              first = results[0]
+              return float(first["latitude"]), float(first["longitude"])
+      except Exception as e:
+          print(f"[WARN] Geocode failed for {state_query}: {e}")
+      return None, None
+  
+  # 1) Build the list of unique states to look up
+  if "state_name" in wide.columns:
+      state_frame = wide.select("state_abbr","state_name").unique()
+  else:
+      # If you don't have state_name, derive it from the abbreviation
+      state_frame = wide.select("state_abbr").unique().with_columns(
+          pl.col("state_abbr").map_elements(lambda ab: ABBR_TO_NAME.get(ab, ab)).alias("state_name")
+      )
+  
+  states = list(zip(state_frame.get_column("state_abbr").to_list(),
+                    state_frame.get_column("state_name").to_list()))
+  
+  # 2) Query API once per state (with a short pause to be polite)
+  lat_map: dict[str, float] = {}
+  lon_map: dict[str, float] = {}
+  
+  for abbr, name in states:
+      lat, lon = geocode_state_latlon(name)
+      # Some names (e.g., District of Columbia) sometimes resolve oddly. Fallback: try "Washington, DC".
+      if lat is None or lon is None:
+          if abbr == "DC":
+              lat, lon = geocode_state_latlon("Washington, District of Columbia")
+              if lat is None or lon is None:
+                  lat, lon = geocode_state_latlon("Washington DC")
+      lat_map[abbr] = lat
+      lon_map[abbr] = lon
+      time.sleep(0.35)  # be nice to the free API
+      
+  # attach state coords using the desired column names
+  wide = wide.with_columns(
+      pl.col("state_abbr").replace(lat_map).alias("latitude"),
+      pl.col("state_abbr").replace(lon_map).alias("longitude"),
   )
   
-  combined_data = combined_data.rename({
-    "total_2023": "total_crime",
-    "rate_per_100k": "crime_rate_per_100k",
-    "poverty_below": "below_poverty"
-  })
+  # sanity check for unmapped states
+  missing = wide.filter(pl.any_horizontal([pl.col("latitude").is_null(), pl.col("longitude").is_null()]))
+  if missing.height:
+      print("Unmapped states:", missing.select("state_abbr").unique().to_series().to_list())
   
-  combined_data.write_csv("crime_plus_poverty_2023.csv")
-  print(f"Rows in combined_data: {combined_data.shape[0]}")
-  print(combined_data.head(8))
+  wide.write_csv("crime_plus_poverty_2023.csv")
 
 if __name__ == "__main__":
     main()
